@@ -49,11 +49,10 @@ except Exception:
 try:
     result_languages_file = os.path.join(install_folder, "result_languages.txt")
     with open(result_languages_file, "r") as fh:
-        result_languages_list = [_.strip().split("=")[0] for _ in fh.readlines()]
-
+        result_languages_dict = {_.split("=")[0].strip():_.split("=")[1].strip()  for _ in fh.readlines()}
 except Exception as e:
     print(f"There was an issue loading the result languages file.  Exception: {e}")
-    result_languages_list = []
+    result_languages_dict = []
 
 
 def get_tbs(from_date, to_date):
@@ -164,12 +163,13 @@ class SearchClient:
         ROOT_LOGGER.setLevel((6 - self.verbosity) * 10)
 
         # Argument checks.
-        if self.lang_result not in result_languages_list:
+        if self.lang_result not in result_languages_dict:
             ROOT_LOGGER.error(
                 f"{self.lang_result} is not a valid language result.  See {result_languages_file} for the list of valid "
                 'languages.  Setting lang_result to "lang_en".'
             )
             self.lang_result = "lang_en"
+        self.lang_result = result_languages_dict[self.lang_result]
 
         if self.num > 100:
             ROOT_LOGGER.warning("The largest value allowed by Google for num is 100.  Setting num to 100.")
