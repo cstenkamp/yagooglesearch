@@ -13,7 +13,7 @@ setuptools.setup(
     long_description_content_type="text/markdown",
     url="https://github.com/opsdisk/yagooglesearch",
     packages=setuptools.find_packages(),
-    package_data={"yagooglesearch": ["user_agents.txt"]},
+    package_data={"yagooglesearch": ["results_languages.txt", "user_agents.txt"]},
     install_requires=[
         "beautifulsoup4>=4.9.3",
         "requests>=2.31.0",
