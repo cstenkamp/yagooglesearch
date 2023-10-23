@@ -344,6 +344,23 @@ class SearchClient:
             verify=self.verify_ssl,
         )
 
+        # Click cookie-banner if it exists
+        soup = BeautifulSoup(response.text, 'html.parser')
+        if soup.title.text == 'Before you continue to Google Search':
+            ROOT_LOGGER.warning("Sending another request to get rid of the cookie-banner")
+            cookie_forms = soup.find_all("form", {"action": f"https://consent.google.{self.tld}/save"})
+            if cookie_forms:
+                form_inputs = {i.attrs["name"]: i.attrs["value"]
+                               for i in cookie_forms[-1].children
+                               if i.name == "input" and i.attrs["type"] == "hidden"}
+                response = requests.post(cookie_forms[-1].attrs["action"],
+                                         data=form_inputs,
+                                         proxies=self.proxy_dict,
+                                         headers=headers,
+                                         cookies=self.cookies,
+                                         timeout=15,
+                                         verify=self.verify_ssl)
+
         # Update the cookies.
         self.cookies = response.cookies
 
