@@ -4,10 +4,12 @@ import os
 import random
 import time
 import urllib
+from datetime import datetime
 
 # Third party Python libraries.
 from bs4 import BeautifulSoup
 import requests
+import librecaptcha
 
 # Custom Python libraries.
 
@@ -180,7 +182,7 @@ class SearchClient:
         if self.google_exemption:
             self.cookies = {"GOOGLE_ABUSE_EXEMPTION": self.google_exemption}
         else:
-            self.cookies = None
+            self.cookies = {}
 
         # Used later to ensure there are not any URL parameter collisions.
         self.url_parameters = (
@@ -344,25 +346,39 @@ class SearchClient:
             verify=self.verify_ssl,
         )
 
+        # Update the cookies.
+        if not self.cookies:
+            self.cookies = response.cookies
+        else:
+            self.cookies.update(response.cookies)
+
         # Click cookie-banner if it exists
         soup = BeautifulSoup(response.text, 'html.parser')
         if soup.title.text == 'Before you continue to Google Search':
             ROOT_LOGGER.warning("Sending another request to get rid of the cookie-banner")
             cookie_forms = soup.find_all("form", {"action": f"https://consent.google.{self.tld}/save"})
             if cookie_forms:
-                form_inputs = {i.attrs["name"]: i.attrs["value"]
-                               for i in cookie_forms[-1].children
-                               if i.name == "input" and i.attrs["type"] == "hidden"}
-                response = requests.post(cookie_forms[-1].attrs["action"],
-                                         data=form_inputs,
-                                         proxies=self.proxy_dict,
-                                         headers=headers,
-                                         cookies=self.cookies,
-                                         timeout=15,
-                                         verify=self.verify_ssl)
+                form_buttons = [[j.attrs["value"] for j in i.children if j.get("type") == "submit"] for i in cookie_forms]
+                if any((accept := [i and i[0] == "Accept all" for i in form_buttons])):
+                    accept_form = cookie_forms[accept.index(True)]
+                    form_inputs = {i.attrs["name"]: i.attrs["value"]
+                                   for i in accept_form.children
+                                   if i.name == "input" and i.attrs["type"] == "hidden"}
+                    response = requests.post(accept_form.attrs["action"],
+                                             data=form_inputs,
+                                             proxies=self.proxy_dict,
+                                             headers=headers,
+                                             cookies=self.cookies,
+                                             timeout=15,
+                                             verify=self.verify_ssl)
 
-        # Update the cookies.
-        self.cookies = response.cookies
+                    # Update the cookies.
+                    if not self.cookies:
+                        self.cookies = response.cookies
+                    else:
+                        self.cookies.update(response.cookies)
+                        self.cookies.update(response.history[0].cookies)
+
 
         # Extract the HTTP response code.
         http_response_code = response.status_code
@@ -384,7 +400,7 @@ class SearchClient:
                 )
 
                 # Convert the cookiejar data structure to a Python dict.
-                cookie_dict = requests.utils.dict_from_cookiejar(self.cookies)
+                cookie_dict = self.cookies if isinstance(self.cookies, dict) else requests.utils.dict_from_cookiejar(self.cookies)
 
                 # Pull out the random number assigned to the response cookie.
                 number = cookie_dict["CONSENT"].split("+")[1]
@@ -403,7 +419,10 @@ class SearchClient:
                     https://github.com/benbusby/whoogle-search/issues/311#issuecomment-841065630
                 XYZ - Random 3-digit number assigned to the first response cookie.
                 """
-                self.cookies = {"CONSENT": f"YES+shp.gws-20211108-0-RC1.fr+F+{number}"}
+                now = datetime.now()
+                consent_cookie = 'YES+cb.{:d}{:02d}{:02d}-17-p0.de+F+{}'.format(now.year, now.month, now.day, number)
+                # f"YES+shp.gws-20211108-0-RC1.fr+F+{number}"
+                self.cookies["CONSENT"] = consent_cookie
 
                 ROOT_LOGGER.info(f"Updating cookie to: {self.cookies}")
 
@@ -418,6 +437,25 @@ class SearchClient:
 
         elif http_response_code == 429:
             ROOT_LOGGER.warning("Google is blocking your IP for making too many requests in a specific time period.")
+            import sys
+            from book_to_money.scrap_book import browser_open
+            from urllib import parse
+            sys.setrecursionlimit(3000)
+            sitekey = soup.find("div", {"class": "g-recaptcha"}).attrs["data-sitekey"]
+            token = librecaptcha.get_token(sitekey, url, USER_AGENT, gui=False)
+            sys.setrecursionlimit(1000)
+            captcha_form = soup.find("form", {"id": "captcha-form"})
+            form_inputs = {i.attrs["name"]: i.attrs["value"] for i in captcha_form.children if i.name == "input" and i.attrs["type"] == "hidden"}
+            # del form_inputs["q"]
+            form_inputs["g-recaptcha-response"] = token
+            # https://developers.google.com/recaptcha/docs/verify: the response token is "a string argument to your callback function if data-callback is specified in either the g-recaptcha tag attribute"
+            captcha_url = "https://www.google.com/sorry/index"
+            referer = captcha_url + "?continue=" + "https:"+parse.quote(form_inputs["continue"][6:]) + f"&q={form_inputs['q']}"
+            print("Referer:", referer)
+            print("Form-Inputs:", form_inputs)
+            response2 = requests.post(captcha_url, data=form_inputs, proxies=self.proxy_dict, headers={**headers, "Referer": referer}, cookies=self.cookies, timeout=15, verify=self.verify_ssl)
+            print()
+
 
             # Calling script does not want yagooglesearch to handle HTTP 429 cool off and retry.  Just return a
             # notification string.
