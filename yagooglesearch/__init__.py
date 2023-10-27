@@ -5,56 +5,49 @@ import random
 import time
 import urllib
 from datetime import datetime
+import sys
 
 # Third party Python libraries.
 from bs4 import BeautifulSoup
 import requests
 import librecaptcha
 
-# Custom Python libraries.
 
-__version__ = "1.8.1"
+__version__ = "2.0.0"
 
 # Logging
-ROOT_LOGGER = logging.getLogger("yagooglesearch")
-# ISO 8601 datetime format by default.
-# LOG_FORMATTER = logging.Formatter("%(asctime)s [%(threadName)-12.12s] [%(levelname)s] %(message)s")
+ROOT_LOGGER = logging.getLogger("yagooglesearch")  # ISO 8601 datetime format by default.
 
+# LOG_FORMATTER = logging.Formatter("%(asctime)s [%(threadName)-12.12s] [%(levelname)s] %(message)s")
+#
 # Setup file logging.
 # log_file_handler = logging.FileHandler("yagooglesearch.py.log")
 # log_file_handler.setFormatter(LOG_FORMATTER)
 # ROOT_LOGGER.addHandler(log_file_handler)
-
+#
 # Setup console logging.
 # console_handler = logging.StreamHandler()
 # console_handler.setFormatter(LOG_FORMATTER)
 # ROOT_LOGGER.addHandler(console_handler)
 
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.131 Safari/537.36"
-
-# Load the list of valid user agents from the install folder.  The search order is:
-# 1) user_agents.txt
-# 2) default USER_AGENT
 install_folder = os.path.abspath(os.path.split(__file__)[0])
 
 try:
     user_agents_file = os.path.join(install_folder, "user_agents.txt")
     with open(user_agents_file, "r") as fh:
-        user_agents_list = [_.strip() for _ in fh.readlines()]
-
+        USER_AGENTS_LIST = [_.strip() for _ in fh.readlines()]
 except Exception:
-    user_agents_list = [USER_AGENT]
+    USER_AGENTS_LIST = ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.131 Safari/537.36"]
 
 
-# Load the list of result languages.  Compiled by viewing the source code at https://www.google.com/advanced_search for
-# the supported languages.
+# Load the list of result languages.  Compiled by viewing the source code at https://www.google.com/advanced_search for the supported languages.
 try:
     result_languages_file = os.path.join(install_folder, "result_languages.txt")
     with open(result_languages_file, "r") as fh:
-        result_languages_dict = {_.split("=")[0].strip():_.split("=")[1].strip()  for _ in fh.readlines()}
+        RESULTS_LANGUAGES_DICT = {_.split("=")[0].strip():_.split("=")[1].strip() for _ in fh.readlines()}
 except Exception as e:
     print(f"There was an issue loading the result languages file.  Exception: {e}")
-    result_languages_dict = []
+    RESULTS_LANGUAGES_DICT = []
 
 
 def get_tbs(from_date, to_date):
@@ -77,19 +70,18 @@ def get_tbs(from_date, to_date):
 
 
 class SearchClient:
+
+    # Used later to ensure there are not any URL parameter collisions.
+    URL_PARAMETERS = ("btnG", "cr", "hl", "num", "q", "safe", "start", "tbs", "lr")
+
     def __init__(
         self,
-        query,
         tld="com",
         lang_html_ui=None,
         lang_result=None,
         tbs="0",
         safe="off",
-        start=0,
-        num=100,
         country="",
-        extra_params=None,
-        max_search_result_urls_to_return=100,
         minimum_delay_between_paged_results_in_seconds=7,
         user_agent=None,
         yagooglesearch_manages_http_429s=True,
@@ -100,24 +92,18 @@ class SearchClient:
         verbosity=5,
         verbose_output=False,
         google_exemption=None,
+        kill_event=None,
     ):
         """
         SearchClient
-        :param str query: Query string.  Must NOT be url-encoded.
         :param str tld: Top level domain.
         :param str lang_html_ui: HTML User Interface language.
         :param str lang_result: Search result language.
         :param str tbs: Verbatim search or time limits (e.g., "qdr:h" => last hour, "qdr:d" => last 24 hours, "qdr:m"
             => last month).
         :param str safe: Safe search.
-        :param int start: First page of results to retrieve.
-        :param int num: Max number of results to pull back per page.  Capped at 100 by Google.
         :param str country: Country or region to focus the search on.  Similar to changing the TLD, but does not yield
             exactly the same results.  Only Google knows why...
-        :param dict extra_params: A dictionary of extra HTTP GET parameters, which must be URL encoded.  For example if
-            you don't want Google to filter similar results you can set the extra_params to {'filter': '0'} which will
-            append '&filter=0' to every query.
-        :param int max_search_result_urls_to_return: Max URLs to return for the entire Google search.
         :param int minimum_delay_between_paged_results_in_seconds: Minimum time to wait between HTTP requests for
             consecutive pages for the same search query.  The actual time will be a random value between this minimum
             value and value + 11 to make it look more human.
@@ -138,20 +124,14 @@ class SearchClient:
         :rtype: List of str
         :return: List of URLs found or list of {"rank", "title", "description", "url"}
         """
-        self.webcalls = 0
-        self.query = urllib.parse.quote_plus(query)
         self.tld = tld
         self.lang_html_ui = lang_html_ui
         self.lang_result = lang_result.lower() if lang_result is not None else None
         self.tbs = tbs
         self.safe = safe
-        self.start = start
-        self.num = num
         self.country = country
-        self.extra_params = extra_params or {}
-        self.max_search_result_urls_to_return = max_search_result_urls_to_return
         self.minimum_delay_between_paged_results_in_seconds = minimum_delay_between_paged_results_in_seconds
-        self.user_agent = user_agent
+        self.default_user_agent = user_agent
         self.yagooglesearch_manages_http_429s = yagooglesearch_manages_http_429s
         self.http_429_cool_off_time_in_minutes = http_429_cool_off_time_in_minutes
         self.http_429_cool_off_factor = http_429_cool_off_factor
@@ -161,85 +141,70 @@ class SearchClient:
         self.verbose_output = verbose_output
         self.google_exemption = google_exemption
         self.url_home = f"https://www.google.{self.tld}"
+        self.kill_event = kill_event
 
         # Assign log level.
         ROOT_LOGGER.setLevel((6 - self.verbosity) * 10)
 
         # Argument checks.
         if self.lang_result is not None:
-            if self.lang_result not in result_languages_dict:
+            if self.lang_result not in RESULTS_LANGUAGES_DICT:
                 ROOT_LOGGER.error(
                     f"{self.lang_result} is not a valid language result.  See {result_languages_file} for the list of valid "
                     'languages.  Setting lang_result to "lang_en".'
                 )
                 self.lang_result = "lang_en"
-            self.lang_result = result_languages_dict[self.lang_result]
+            self.lang_result = RESULTS_LANGUAGES_DICT[self.lang_result]
 
-        if self.num > 100:
-            ROOT_LOGGER.warning("The largest value allowed by Google for num is 100.  Setting num to 100.")
-            self.num = 100
-
-        # Populate cookies with GOOGLE_ABUSE_EXEMPTION if it is provided.  Otherwise, initialize cookies to None.
-        # It will be updated with each request in get_page().
-        if self.google_exemption:
-            self.cookies = {"GOOGLE_ABUSE_EXEMPTION": self.google_exemption}
-        else:
-            self.cookies = {}
-
-        # Used later to ensure there are not any URL parameter collisions.
-        self.url_parameters = ("btnG", "cr", "hl", "num", "q", "safe", "start", "tbs", "lr")
-
-        # Default user agent, unless instructed by the user to change it.
-        if not user_agent:
-            self.user_agent = self.assign_random_user_agent()
+        # Populate cookies with GOOGLE_ABUSE_EXEMPTION if it is provided.  Otherwise, initialize empty. Will be updated with each request in get_page().
+        self.cookies = {"GOOGLE_ABUSE_EXEMPTION": self.google_exemption} if self.google_exemption else {}
 
         # Initialize proxy_dict.
-        self.proxy_dict = {}
-
-        # Update proxy_dict if a proxy is provided.
-        if proxy:
-            self.proxy_dict = {
-                "http": self.proxy,
-                "https": self.proxy,
-            }
+        self.proxy_dict = {"http": self.proxy, "https": self.proxy} if self.proxy else {}
 
         # Suppress warning messages if verify_ssl is disabled.
         if not self.verify_ssl:
             requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
 
+        self.reset_search(firsttime=True)
+        ROOT_LOGGER.info("yagooglesearch initialized.")
 
-    def get_url(self, start=None, num=None):
+
+    def reset_search(self, firsttime=False, new_ua=True):
+        if new_ua:
+            self.assign_user_agent(self.default_user_agent)
+        if firsttime:
+            # Simulates browsing to the https://www.google.com home page and retrieving the initial cookie.
+            self.get_page(self.url_home)
+            self.last_webcalls = self.webcalls = 1
+
+    def get_url(self, query, start=None, num=None, extra_params=None):
         url = (
-                self.url_home + f"/search?q={self.query}&safe={self.safe}&"
+                self.url_home + f"/search?q={query}&safe={self.safe}&"
                 + (f"hl={self.lang_html_ui}&" if self.lang_html_ui else "")
                 + (f"lr={self.lang_result}&" if self.lang_result is not None else "")
                 + (f"cr={self.country}&" if self.country is not None else "")
                 + f"filter=0&tbs={self.tbs}"
         )
-        url += (f"&btnG=Google+Search" if start in [None, 0] else f"&start={self.start}")
+        url += (f"&btnG=Google+Search" if start in [None, 0] else f"&start={start}")
         if num is not None:
-            url += f"&num={self.num}"
+            url += f"&num={num}"
 
-        for builtin_param in self.url_parameters: # Check extra_params for overlapping parameters.
-            if builtin_param in self.extra_params.keys():
+        extra_params = extra_params or {}
+        for builtin_param in self.URL_PARAMETERS: # Check extra_params for overlapping parameters.
+            if builtin_param in extra_params.keys():
                 raise ValueError(f'GET parameter "{builtin_param}" is overlapping with the built-in GET parameter')
-        for key, value in self.extra_params.items(): # Append extra GET parameters to the URL.  The keys and values are not URL encoded.
+        for key, value in extra_params.items(): # Append extra GET parameters to the URL.  The keys and values are not URL encoded.
             url += f"&{key}={value}"
 
         return url
 
+    def assign_user_agent(self, user_agent=None):
+        self.user_agent = user_agent or random.choice(USER_AGENTS_LIST)
 
-    def assign_random_user_agent(self):
-        """Assign a random user agent string.
-
-        :rtype: str
-        :return: Random user agent string.
-        """
-
-        random_user_agent = random.choice(user_agents_list)
-        self.user_agent = random_user_agent
-
-        return random_user_agent
+    @property
+    def headers(self):
+        return {"User-Agent": self.user_agent}
 
     def filter_search_result_urls(self, link):
         """Filter links found in the Google result pages HTML code.  Valid results are absolute URLs not pointing to a
@@ -290,46 +255,58 @@ class SearchClient:
     def http_429_detected(self):
         """Increase the HTTP 429 cool off period."""
 
-        new_http_429_cool_off_time_in_minutes = round(
-            self.http_429_cool_off_time_in_minutes * self.http_429_cool_off_factor, 2
-        )
+        new_http_429_cool_off_time_in_minutes = round(self.http_429_cool_off_time_in_minutes * self.http_429_cool_off_factor, 2)
         ROOT_LOGGER.info(
             f"Increasing HTTP 429 cool off time by a factor of {self.http_429_cool_off_factor}, "
             f"from {self.http_429_cool_off_time_in_minutes} minutes to {new_http_429_cool_off_time_in_minutes} minutes"
         )
         self.http_429_cool_off_time_in_minutes = new_http_429_cool_off_time_in_minutes
 
-    def get_page(self, url):
-        """
-        Request the given URL and return the response page.
+    def debug_requests_response(self, response):
+        ROOT_LOGGER.debug(f"    status_code: {response.status_code}")
+        ROOT_LOGGER.debug(f"    headers: {self.headers}")
+        ROOT_LOGGER.debug(f"    cookies: {self.cookies}")
+        ROOT_LOGGER.debug(f"    proxy: {self.proxy}")
+        ROOT_LOGGER.debug(f"    verify_ssl: {self.verify_ssl}")
 
-        :param str url: URL to retrieve.
-
-        :rtype: str
-        :return: Web page HTML retrieved for the given URL
-        """
-
-        headers = {
-            "User-Agent": self.user_agent,
-        }
-
+    def request(self, url, data=None, timeout=15, type="GET", additional_headers=None, update_cookies=True):
         ROOT_LOGGER.info(f"Requesting URL: {url}")
-        self.webcalls += 1 # we use this to check if we did actually access the web or just the cache
-        response = requests.get(
-            url,
-            proxies=self.proxy_dict,
-            headers=headers,
-            cookies=self.cookies,
-            timeout=15,
-            verify=self.verify_ssl,
-        )
+        headers = self.headers if additional_headers is None else {**self.headers, **additional_headers}
 
-        # Update the cookies.
-        if not self.cookies:
-            self.cookies = response.cookies
+        if type == "POST":
+            response = requests.post(url,
+                                     data=data or {},
+                                     proxies=self.proxy_dict,
+                                     headers=headers,
+                                     cookies=self.cookies,
+                                     timeout=timeout,
+                                     verify=self.verify_ssl)
+        elif type == "GET":
+            assert not data
+            response = requests.get(url,
+                                    proxies=self.proxy_dict,
+                                    headers=headers,
+                                    cookies=self.cookies,
+                                    timeout=timeout,
+                                    verify=self.verify_ssl)
         else:
-            self.cookies.update(response.cookies)
+            raise NotImplementedError()
 
+        self.webcalls = getattr(self, "webcalls", 0) + 1  # we use this to check if we did actually access the web or just the cache
+        self.debug_requests_response(response)
+        if update_cookies:
+            self.update_cookies(response.cookies)
+            for history_elem in response.history:
+                self.update_cookies(history_elem.cookies)
+        return response
+
+    def update_cookies(self, cookies):
+        if not self.cookies:
+            self.cookies = cookies
+        else:
+            self.cookies.update(cookies)
+
+    def check_cookie_banner(self, response):
         # Click cookie-banner if it exists
         soup = BeautifulSoup(response.text, 'html.parser')
         if soup.find("form", {"action": "https://consent.google.de/save"}):
@@ -337,37 +314,15 @@ class SearchClient:
             cookie_forms = soup.find_all("form", {"action": f"https://consent.google.{self.tld}/save"})
             if cookie_forms:
                 form_buttons = [[j.attrs["value"] for j in i.children if j.get("type") == "submit"] for i in cookie_forms]
-                if any((accept := [i and i[0] in ["Accept all", "Alle akzeptieren"] for i in form_buttons])):
+                if any((accept := [i and i[0] in ["Accept all", "Alle akzeptieren"] for i in form_buttons])): # TODO other languages
                     accept_form = cookie_forms[accept.index(True)]
                     form_inputs = {i.attrs["name"]: i.attrs["value"]
                                    for i in accept_form.children
                                    if i.name == "input" and i.attrs["type"] == "hidden"}
-                    response = requests.post(accept_form.attrs["action"],
-                                             data=form_inputs,
-                                             proxies=self.proxy_dict,
-                                             headers=headers,
-                                             cookies=self.cookies,
-                                             timeout=15,
-                                             verify=self.verify_ssl)
+                    response = self.request(accept_form.attrs["action"], data=form_inputs, type="POST")
+        return response
 
-                    # Update the cookies.
-                    if not self.cookies:
-                        self.cookies = response.cookies
-                    else:
-                        self.cookies.update(response.cookies)
-                        self.cookies.update(response.history[0].cookies)
-
-
-        # Extract the HTTP response code.
-        http_response_code = response.status_code
-
-        # debug_requests_response(response)
-        ROOT_LOGGER.debug(f"    status_code: {http_response_code}")
-        ROOT_LOGGER.debug(f"    headers: {headers}")
-        ROOT_LOGGER.debug(f"    cookies: {self.cookies}")
-        ROOT_LOGGER.debug(f"    proxy: {self.proxy}")
-        ROOT_LOGGER.debug(f"    verify_ssl: {self.verify_ssl}")
-
+    def set_consent_cookie(self, response):
         # Google throws up a consent page for searches sourcing from a European Union country IP location.
         # See https://github.com/benbusby/whoogle-search/issues/311
         try:
@@ -408,35 +363,50 @@ class SearchClient:
         except KeyError:
             pass
 
+    def solve_recaptcha(self, response, url):
+        soup = BeautifulSoup(response.text, 'html.parser')
+        sys.setrecursionlimit(3000)
+        sitekey = soup.find("div", {"class": "g-recaptcha"}).attrs["data-sitekey"]
+        token = librecaptcha.get_token(sitekey, url, self.user_agent, gui=False)
+        sys.setrecursionlimit(1000)
+        captcha_form = soup.find("form", {"id": "captcha-form"})
+        form_inputs = {i.attrs["name"]: i.attrs["value"] for i in captcha_form.children if i.name == "input" and i.attrs["type"] == "hidden"}
+        # del form_inputs["q"]
+        form_inputs["g-recaptcha-response"] = token
+        # https://developers.google.com/recaptcha/docs/verify: the response token is "a string argument to your callback function if data-callback is specified in either the g-recaptcha tag attribute"
+        captcha_url = "https://www.google.com/sorry/index"
+        referer = captcha_url + "?continue=" + "https:"+urllib.parse.quote(form_inputs["continue"][6:]) + f"&q={form_inputs['q']}"
+        print("Referer:", referer)
+        print("Form-Inputs:", form_inputs)
+        response2 = self.request(captcha_url, data=form_inputs, additional_headers={"Referer": referer}) # TODO don't update cookies?
+        print()
+
+    def get_page(self, url):
+        """
+        Request the given URL and return the response page.
+        :param str url: URL to retrieve.
+        :rtype: str
+        :return: Web page HTML retrieved for the given URL
+        """
+        response = self.request(url)
+
+        # if this page displays a cookie-banner, follow the "accept" form and set the response-variable to the result of the following page instead
+        response = self.check_cookie_banner(response)
+        self.set_consent_cookie(response)
+        # TODO: do these both ^ in the first get-google.com call
+
         html = ""
 
-        if http_response_code == 200:
+        if response.status_code == 200:
             html = response.text
 
-        elif http_response_code == 429:
+        elif response.status_code == 429:
             ROOT_LOGGER.warning("Google is blocking your IP for making too many requests in a specific time period.")
-            import sys
-            from book_to_money.scrap_book import browser_open
-            from urllib import parse
-            sys.setrecursionlimit(3000)
-            sitekey = soup.find("div", {"class": "g-recaptcha"}).attrs["data-sitekey"]
-            token = librecaptcha.get_token(sitekey, url, USER_AGENT, gui=False)
-            sys.setrecursionlimit(1000)
-            captcha_form = soup.find("form", {"id": "captcha-form"})
-            form_inputs = {i.attrs["name"]: i.attrs["value"] for i in captcha_form.children if i.name == "input" and i.attrs["type"] == "hidden"}
-            # del form_inputs["q"]
-            form_inputs["g-recaptcha-response"] = token
-            # https://developers.google.com/recaptcha/docs/verify: the response token is "a string argument to your callback function if data-callback is specified in either the g-recaptcha tag attribute"
-            captcha_url = "https://www.google.com/sorry/index"
-            referer = captcha_url + "?continue=" + "https:"+parse.quote(form_inputs["continue"][6:]) + f"&q={form_inputs['q']}"
-            print("Referer:", referer)
-            print("Form-Inputs:", form_inputs)
-            response2 = requests.post(captcha_url, data=form_inputs, proxies=self.proxy_dict, headers={**headers, "Referer": referer}, cookies=self.cookies, timeout=15, verify=self.verify_ssl)
-            print()
 
+            self.solve_recaptcha(response, url)
+            # TODO: this ^ only optional and if interactive and ...
 
-            # Calling script does not want yagooglesearch to handle HTTP 429 cool off and retry.  Just return a
-            # notification string.
+            # Calling script does not want yagooglesearch to handle HTTP 429 cool off and retry.  Just return a notification string.
             if not self.yagooglesearch_manages_http_429s:
                 ROOT_LOGGER.info("Since yagooglesearch_manages_http_429s=False, yagooglesearch is done.")
                 return "HTTP_429_DETECTED"
@@ -449,19 +419,22 @@ class SearchClient:
             html = self.get_page(url)
 
         else:
-            ROOT_LOGGER.warning(f"HTML response code: {http_response_code}")
+            ROOT_LOGGER.warning(f"HTML response code: {response.status_code}")
 
         return html
 
-
-    def results_from_url(self, url):
+    def results_from_url(self, url, prev_results_ref=None):
         # we want to cache this method, so ensure that this is side-effect free!
         results = []
+        prev_results_ref = prev_results_ref or []
 
         html = self.get_page(url) # Request Google search results.
-        # HTTP 429 message returned from get_page() function, add "HTTP_429_DETECTED" to the set and return to the calling script.
+
         if html == "HTTP_429_DETECTED":
+            # HTTP 429 message returned from get_page() function, add "HTTP_429_DETECTED" to the set and return to the calling script.
+            # this happens only if yagooglesearch_manages_429 == False
             return ["HTTP_429_DETECTED"]
+
         soup = BeautifulSoup(html, "html.parser")
 
         # Find all HTML <a> elements.
@@ -501,64 +474,81 @@ class SearchClient:
                     description = ""
 
             # Check if URL has already been found.
-            if link not in self.search_result_list+results:
-                ROOT_LOGGER.info(f"Found unique URL #{len(self.search_result_list)+len(results)+1}: {link}")
-                elem = { "rank": len(self.search_result_list)+len(results),  # Approximate rank according to yagooglesearch.
-                         "title": title.strip(),  # Remove leading and trailing spaces.
-                         "description": description.strip(),  # Remove leading and trailing spaces.
-                         "url": link,
-                       } if self.verbose_output else link
+            if link not in prev_results_ref+results:
+                link_rank = len(prev_results_ref)+len(results) # Approximate rank according to yagooglesearch.
+                ROOT_LOGGER.info(f"Found unique URL #{link_rank+1}: {link}")
+                elem = { "rank": link_rank, "title": title.strip(), "description": description.strip(), "url": link} \
+                    if self.verbose_output else link
                 results.append(elem)
             else:
                 ROOT_LOGGER.info(f"Duplicate URL found: {link}")
 
         return results
 
-    def search_gen(self, kill_event=None):
-        self.search_result_list = [] # Consolidate search results.
+    def sleep_against_429(self):
+        if self.last_webcalls < self.webcalls: # we use this to check if something came from cache or not
+            # Randomize sleep time between paged requests to make it look more human.
+            random_sleep_time = random.choice(range(self.minimum_delay_between_paged_results_in_seconds, self.minimum_delay_between_paged_results_in_seconds + 11))
+            ROOT_LOGGER.info(f"Sleeping {random_sleep_time} seconds until retrieving the next page of results...")
+            for _ in range(random_sleep_time):
+                if self.killed:
+                    return
+                time.sleep(1)
+            self.last_webcalls = self.webcalls
 
-        html = self.get_page(self.url_home)  # Simulates browsing to the https://www.google.com home page and retrieving the initial cookie.
-        self.last_webcalls = self.webcalls
+    @property
+    def killed(self):
+        return self.kill_event is not None and self.kill_event.is_set()
 
-        # Loop until we reach the maximum result results found or there are no more search results found to reach
-        # max_search_result_urls_to_return.
-        while len(self.search_result_list) <= self.max_search_result_urls_to_return:
+    def search_gen(self, query, start=0, num=100, extra_params=None, max_result_urls=30, assign_new_ua=False):
+        """
+        :param str query: Query string.  Must NOT be url-encoded.
+        :param int start: First page of results to retrieve.
+        :param int num: Max number of results to pull back per page.  Capped at 100 by Google.
+        :param int max_result_urls: Max URLs to return for the entire Google search.
+        :param dict extra_params: A dictionary of extra HTTP GET parameters, which must be URL encoded.  For example if
+            you don't want Google to filter similar results you can set the extra_params to {'filter': '0'} which will
+            append '&filter=0' to every query.
+        """
+        if num > 100:
+            ROOT_LOGGER.warning("The largest value allowed by Google for num is 100.  Setting num to 100.")
+            num = 100
+        query = urllib.parse.quote_plus(query)
 
-            ROOT_LOGGER.info(
-                f"Stats: start={self.start}, num={self.num}, total_valid_links_found={len(self.search_result_list)} / "
-                f"max_search_result_urls_to_return={self.max_search_result_urls_to_return}"
-            )
+        self.reset_search(new_ua=assign_new_ua) # if demanded, every  new search is done with a new user-agent
+        search_result_list = [] # Consolidate search results.
 
-            url = self.get_url(self.start, self.num)
-            new_results = self.results_from_url(url)
+        # Loop until we reach the maximum result results found or there are no more search results found to reach max_result_urls.
+        while len(search_result_list) <= max_result_urls:
+
+            ROOT_LOGGER.info(f"Stats: start={start}, num={num}, non-dup links found={len(search_result_list)}/{max_result_urls}")
+
+            url = self.get_url(query, start=start, num=num, extra_params=extra_params)
+            new_results = self.results_from_url(url, prev_results_ref=search_result_list)
 
             if new_results == ["HTTP_429_DETECTED"]:
-                self.search_result_list.append("HTTP_429_DETECTED")
+                # this happens only if yagooglesearch_manages_429 == False
+                search_result_list.append("HTTP_429_DETECTED")
                 yield "HTTP_429_DETECTED" # TODO this is what effing exceptions are for
+                return "HTTP_429_DETECTED"
             elif not new_results:
                 # Determining if a "Next" URL page of results is not straightforward. If no valid links are found, the search results have been exhausted.
                 ROOT_LOGGER.info("No valid search results found on this page. Returning.")
-                return
+                return "SEARCH_EXHAUSTED"
 
             for elem in new_results:
-                self.search_result_list.append(elem)
+                search_result_list.append(elem)
                 yield elem
-                if self.max_search_result_urls_to_return <= len(self.search_result_list):
+                if max_result_urls <= len(search_result_list):
                     # If we reached the limit of requested URLs, return with the results.
-                    ROOT_LOGGER.info("returning because self.max_search_result_urls_to_return reached")
-                    return
+                    ROOT_LOGGER.info("returning because max_result_urls reached")
+                    return "MAX_RESULTS_REACHED"
 
-            self.start += self.num # Bump the starting page URL parameter for the next request.
+            start += num # Bump the starting page URL parameter for the next request.
 
-            if self.last_webcalls < self.webcalls: # we use this to check if something came from cache or not
-                # Randomize sleep time between paged requests to make it look more human.
-                random_sleep_time = random.choice(range(self.minimum_delay_between_paged_results_in_seconds, self.minimum_delay_between_paged_results_in_seconds + 11))
-                ROOT_LOGGER.info(f"Sleeping {random_sleep_time} seconds until retrieving the next page of results...")
-                for _ in range(random_sleep_time):
-                    if kill_event is not None and kill_event.is_set():
-                        ROOT_LOGGER.info("returning because of kill-event")
-                        return
-                    time.sleep(1)
-                self.last_webcalls = self.webcalls
+            self.sleep_against_429()
+            if self.killed:
+                ROOT_LOGGER.info("returning because of kill-event")
+                return "SEARCH_KILLED"
 
         ROOT_LOGGER.info("returning because at the end")
