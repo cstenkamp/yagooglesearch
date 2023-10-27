@@ -18,17 +18,17 @@ __version__ = "1.8.1"
 # Logging
 ROOT_LOGGER = logging.getLogger("yagooglesearch")
 # ISO 8601 datetime format by default.
-LOG_FORMATTER = logging.Formatter("%(asctime)s [%(threadName)-12.12s] [%(levelname)s] %(message)s")
+# LOG_FORMATTER = logging.Formatter("%(asctime)s [%(threadName)-12.12s] [%(levelname)s] %(message)s")
 
 # Setup file logging.
-log_file_handler = logging.FileHandler("yagooglesearch.py.log")
-log_file_handler.setFormatter(LOG_FORMATTER)
-ROOT_LOGGER.addHandler(log_file_handler)
+# log_file_handler = logging.FileHandler("yagooglesearch.py.log")
+# log_file_handler.setFormatter(LOG_FORMATTER)
+# ROOT_LOGGER.addHandler(log_file_handler)
 
 # Setup console logging.
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(LOG_FORMATTER)
-ROOT_LOGGER.addHandler(console_handler)
+# console_handler = logging.StreamHandler()
+# console_handler.setFormatter(LOG_FORMATTER)
+# ROOT_LOGGER.addHandler(console_handler)
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.131 Safari/537.36"
 
@@ -81,8 +81,8 @@ class SearchClient:
         self,
         query,
         tld="com",
-        lang_html_ui="en",
-        lang_result="lang_en",
+        lang_html_ui=None,
+        lang_result=None,
         tbs="0",
         safe="off",
         start=0,
@@ -138,17 +138,17 @@ class SearchClient:
         :rtype: List of str
         :return: List of URLs found or list of {"rank", "title", "description", "url"}
         """
-
+        self.webcalls = 0
         self.query = urllib.parse.quote_plus(query)
         self.tld = tld
         self.lang_html_ui = lang_html_ui
-        self.lang_result = lang_result.lower()
+        self.lang_result = lang_result.lower() if lang_result is not None else None
         self.tbs = tbs
         self.safe = safe
         self.start = start
         self.num = num
         self.country = country
-        self.extra_params = extra_params
+        self.extra_params = extra_params or {}
         self.max_search_result_urls_to_return = max_search_result_urls_to_return
         self.minimum_delay_between_paged_results_in_seconds = minimum_delay_between_paged_results_in_seconds
         self.user_agent = user_agent
@@ -160,18 +160,20 @@ class SearchClient:
         self.verbosity = verbosity
         self.verbose_output = verbose_output
         self.google_exemption = google_exemption
+        self.url_home = f"https://www.google.{self.tld}"
 
         # Assign log level.
         ROOT_LOGGER.setLevel((6 - self.verbosity) * 10)
 
         # Argument checks.
-        if self.lang_result not in result_languages_dict:
-            ROOT_LOGGER.error(
-                f"{self.lang_result} is not a valid language result.  See {result_languages_file} for the list of valid "
-                'languages.  Setting lang_result to "lang_en".'
-            )
-            self.lang_result = "lang_en"
-        self.lang_result = result_languages_dict[self.lang_result]
+        if self.lang_result is not None:
+            if self.lang_result not in result_languages_dict:
+                ROOT_LOGGER.error(
+                    f"{self.lang_result} is not a valid language result.  See {result_languages_file} for the list of valid "
+                    'languages.  Setting lang_result to "lang_en".'
+                )
+                self.lang_result = "lang_en"
+            self.lang_result = result_languages_dict[self.lang_result]
 
         if self.num > 100:
             ROOT_LOGGER.warning("The largest value allowed by Google for num is 100.  Setting num to 100.")
@@ -185,24 +187,11 @@ class SearchClient:
             self.cookies = {}
 
         # Used later to ensure there are not any URL parameter collisions.
-        self.url_parameters = (
-            "btnG",
-            "cr",
-            "hl",
-            "num",
-            "q",
-            "safe",
-            "start",
-            "tbs",
-            "lr",
-        )
+        self.url_parameters = ("btnG", "cr", "hl", "num", "q", "safe", "start", "tbs", "lr")
 
         # Default user agent, unless instructed by the user to change it.
         if not user_agent:
             self.user_agent = self.assign_random_user_agent()
-
-        # Update the URLs with the initial SearchClient attributes.
-        self.update_urls()
 
         # Initialize proxy_dict.
         self.proxy_dict = {}
@@ -218,39 +207,27 @@ class SearchClient:
         if not self.verify_ssl:
             requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
 
-    def update_urls(self):
-        """Update search URLs being used."""
 
-        # URL templates to make Google searches.
-        self.url_home = f"https://www.google.{self.tld}/"
-
-        # First search requesting the default 10 search results.
-        self.url_search = (
-            f"https://www.google.{self.tld}/search?hl={self.lang_html_ui}&lr={self.lang_result}&"
-            f"q={self.query}&btnG=Google+Search&tbs={self.tbs}&safe={self.safe}&"
-            f"cr={self.country}&filter=0"
+    def get_url(self, start=None, num=None):
+        url = (
+                self.url_home + f"/search?q={self.query}&safe={self.safe}&"
+                + (f"hl={self.lang_html_ui}&" if self.lang_html_ui else "")
+                + (f"lr={self.lang_result}&" if self.lang_result is not None else "")
+                + (f"cr={self.country}&" if self.country is not None else "")
+                + f"filter=0&tbs={self.tbs}"
         )
+        url += (f"&btnG=Google+Search" if start in [None, 0] else f"&start={self.start}")
+        if num is not None:
+            url += f"&num={self.num}"
 
-        # Subsequent searches starting at &start= and retrieving 10 search results at a time.
-        self.url_next_page = (
-            f"https://www.google.{self.tld}/search?hl={self.lang_html_ui}&lr={self.lang_result}&"
-            f"q={self.query}&start={self.start}&tbs={self.tbs}&safe={self.safe}&"
-            f"cr={self.country}&filter=0"
-        )
+        for builtin_param in self.url_parameters: # Check extra_params for overlapping parameters.
+            if builtin_param in self.extra_params.keys():
+                raise ValueError(f'GET parameter "{builtin_param}" is overlapping with the built-in GET parameter')
+        for key, value in self.extra_params.items(): # Append extra GET parameters to the URL.  The keys and values are not URL encoded.
+            url += f"&{key}={value}"
 
-        # First search requesting more than the default 10 search results.
-        self.url_search_num = (
-            f"https://www.google.{self.tld}/search?hl={self.lang_html_ui}&lr={self.lang_result}&"
-            f"q={self.query}&num={self.num}&btnG=Google+Search&tbs={self.tbs}&"
-            f"safe={self.safe}&cr={self.country}&filter=0"
-        )
+        return url
 
-        # Subsequent searches starting at &start= and retrieving &num= search results at a time.
-        self.url_next_page_num = (
-            f"https://www.google.{self.tld}/search?hl={self.lang_html_ui}&lr={self.lang_result}&"
-            f"q={self.query}&start={self.start}&num={self.num}&tbs={self.tbs}&"
-            f"safe={self.safe}&cr={self.country}&filter=0"
-        )
 
     def assign_random_user_agent(self):
         """Assign a random user agent string.
@@ -337,6 +314,7 @@ class SearchClient:
         }
 
         ROOT_LOGGER.info(f"Requesting URL: {url}")
+        self.webcalls += 1 # we use this to check if we did actually access the web or just the cache
         response = requests.get(
             url,
             proxies=self.proxy_dict,
@@ -354,12 +332,12 @@ class SearchClient:
 
         # Click cookie-banner if it exists
         soup = BeautifulSoup(response.text, 'html.parser')
-        if soup.title.text == 'Before you continue to Google Search':
+        if soup.find("form", {"action": "https://consent.google.de/save"}):
             ROOT_LOGGER.warning("Sending another request to get rid of the cookie-banner")
             cookie_forms = soup.find_all("form", {"action": f"https://consent.google.{self.tld}/save"})
             if cookie_forms:
                 form_buttons = [[j.attrs["value"] for j in i.children if j.get("type") == "submit"] for i in cookie_forms]
-                if any((accept := [i and i[0] == "Accept all" for i in form_buttons])):
+                if any((accept := [i and i[0] in ["Accept all", "Alle akzeptieren"] for i in form_buttons])):
                     accept_form = cookie_forms[accept.index(True)]
                     form_inputs = {i.attrs["name"]: i.attrs["value"]
                                    for i in accept_form.children
@@ -424,7 +402,7 @@ class SearchClient:
                 # f"YES+shp.gws-20211108-0-RC1.fr+F+{number}"
                 self.cookies["CONSENT"] = consent_cookie
 
-                ROOT_LOGGER.info(f"Updating cookie to: {self.cookies}")
+                ROOT_LOGGER.debug(f"Updating cookie to: {self.cookies}")
 
         # "CONSENT" cookie does not exist.
         except KeyError:
@@ -475,169 +453,112 @@ class SearchClient:
 
         return html
 
-    def search(self):
-        """Start the Google search.
 
-        :rtype: List of str
-        :return: List of URLs found or list of {"rank", "title", "description", "url"}
-        """
+    def results_from_url(self, url):
+        # we want to cache this method, so ensure that this is side-effect free!
+        results = []
 
-        # Consolidate search results.
-        self.search_result_list = []
+        html = self.get_page(url) # Request Google search results.
+        # HTTP 429 message returned from get_page() function, add "HTTP_429_DETECTED" to the set and return to the calling script.
+        if html == "HTTP_429_DETECTED":
+            return ["HTTP_429_DETECTED"]
+        soup = BeautifulSoup(html, "html.parser")
 
-        # Count the number of valid, non-duplicate links found.
-        total_valid_links_found = 0
+        # Find all HTML <a> elements.
+        try:
+            anchors = soup.find(id="search").find_all("a")
+        except AttributeError:
+            # Sometimes (depending on the User-Agent) there is no id "search" in html response.
+            gbar = soup.find(id="gbar")
+            if gbar:
+                gbar.clear() # Remove links from the top bar.
+            anchors = soup.find_all("a")
 
-        # If no extra_params is given, create an empty dictionary. We should avoid using an empty dictionary as a
-        # default value in a function parameter in Python.
-        if not self.extra_params:
-            self.extra_params = {}
+        for a in anchors:
+            try:
+                link = a["href"]
+            except KeyError:
+                ROOT_LOGGER.warning(f"No href for link: {a}")
+                continue
 
-        # Check extra_params for overlapping parameters.
-        for builtin_param in self.url_parameters:
-            if builtin_param in self.extra_params.keys():
-                raise ValueError(f'GET parameter "{builtin_param}" is overlapping with the built-in GET parameter')
+            link = self.filter_search_result_urls(link) # Filter invalid links and links pointing to Google itself.
+            if not link:
+                continue
 
-        # Simulates browsing to the https://www.google.com home page and retrieving the initial cookie.
-        html = self.get_page(self.url_home)
+            if self.verbose_output:
+                try:
+                    title = a.get_text() # Extract the URL title.
+                except Exception:
+                    ROOT_LOGGER.warning(f"No title for link: {link}")
+                    title = ""
+
+                try:  # Extract the URL description.
+                    description = a.parent.parent.contents[1].get_text()
+                    if description == "": # Sometimes Google returns different structures.
+                        description = a.parent.parent.contents[2].get_text()
+                except Exception:
+                    ROOT_LOGGER.warning(f"No description for link: {link}")
+                    description = ""
+
+            # Check if URL has already been found.
+            if link not in self.search_result_list+results:
+                ROOT_LOGGER.info(f"Found unique URL #{len(self.search_result_list)+len(results)+1}: {link}")
+                elem = { "rank": len(self.search_result_list)+len(results),  # Approximate rank according to yagooglesearch.
+                         "title": title.strip(),  # Remove leading and trailing spaces.
+                         "description": description.strip(),  # Remove leading and trailing spaces.
+                         "url": link,
+                       } if self.verbose_output else link
+                results.append(elem)
+            else:
+                ROOT_LOGGER.info(f"Duplicate URL found: {link}")
+
+        return results
+
+    def search_gen(self, kill_event=None):
+        self.search_result_list = [] # Consolidate search results.
+
+        html = self.get_page(self.url_home)  # Simulates browsing to the https://www.google.com home page and retrieving the initial cookie.
+        self.last_webcalls = self.webcalls
 
         # Loop until we reach the maximum result results found or there are no more search results found to reach
         # max_search_result_urls_to_return.
-        while total_valid_links_found <= self.max_search_result_urls_to_return:
+        while len(self.search_result_list) <= self.max_search_result_urls_to_return:
+
             ROOT_LOGGER.info(
-                f"Stats: start={self.start}, num={self.num}, total_valid_links_found={total_valid_links_found} / "
+                f"Stats: start={self.start}, num={self.num}, total_valid_links_found={len(self.search_result_list)} / "
                 f"max_search_result_urls_to_return={self.max_search_result_urls_to_return}"
             )
 
-            # Prepare the URL for the search request.
-            if self.start:
-                if self.num == 10:
-                    url = self.url_next_page
-                else:
-                    url = self.url_next_page_num
-            else:
-                if self.num == 10:
-                    url = self.url_search
-                else:
-                    url = self.url_search_num
+            url = self.get_url(self.start, self.num)
+            new_results = self.results_from_url(url)
 
-            # Append extra GET parameters to the URL.  This is done on every iteration because we're rebuilding the
-            # entire URL at the end of this loop.  The keys and values are not URL encoded.
-            for key, value in self.extra_params.items():
-                url += f"&{key}={value}"
-
-            # Request Google search results.
-            html = self.get_page(url)
-
-            # HTTP 429 message returned from get_page() function, add "HTTP_429_DETECTED" to the set and return to the
-            # calling script.
-            if html == "HTTP_429_DETECTED":
+            if new_results == ["HTTP_429_DETECTED"]:
                 self.search_result_list.append("HTTP_429_DETECTED")
-                return self.search_result_list
+                yield "HTTP_429_DETECTED" # TODO this is what effing exceptions are for
+            elif not new_results:
+                # Determining if a "Next" URL page of results is not straightforward. If no valid links are found, the search results have been exhausted.
+                ROOT_LOGGER.info("No valid search results found on this page. Returning.")
+                return
 
-            # Create the BeautifulSoup object.
-            soup = BeautifulSoup(html, "html.parser")
-
-            # Find all HTML <a> elements.
-            try:
-                anchors = soup.find(id="search").find_all("a")
-            # Sometimes (depending on the User-Agent) there is no id "search" in html response.
-            except AttributeError:
-                # Remove links from the top bar.
-                gbar = soup.find(id="gbar")
-                if gbar:
-                    gbar.clear()
-                anchors = soup.find_all("a")
-
-            # Tracks number of valid URLs found on a search page.
-            valid_links_found_in_this_search = 0
-
-            # Process every anchored URL.
-            for a in anchors:
-                # Get the URL from the anchor tag.
-                try:
-                    link = a["href"]
-                except KeyError:
-                    ROOT_LOGGER.warning(f"No href for link: {link}")
-                    continue
-
-                # Filter invalid links and links pointing to Google itself.
-                link = self.filter_search_result_urls(link)
-                if not link:
-                    continue
-
-                if self.verbose_output:
-                    # Extract the URL title.
-                    try:
-                        title = a.get_text()
-                    except Exception:
-                        ROOT_LOGGER.warning(f"No title for link: {link}")
-                        title = ""
-
-                    # Extract the URL description.
-                    try:
-                        description = a.parent.parent.contents[1].get_text()
-
-                        # Sometimes Google returns different structures.
-                        if description == "":
-                            description = a.parent.parent.contents[2].get_text()
-
-                    except Exception:
-                        ROOT_LOGGER.warning(f"No description for link: {link}")
-                        description = ""
-
-                # Check if URL has already been found.
-                if link not in self.search_result_list:
-                    # Increase the counters.
-                    valid_links_found_in_this_search += 1
-                    total_valid_links_found += 1
-
-                    ROOT_LOGGER.info(f"Found unique URL #{total_valid_links_found}: {link}")
-
-                    if self.verbose_output:
-                        self.search_result_list.append(
-                            {
-                                "rank": total_valid_links_found,  # Approximate rank according to yagooglesearch.
-                                "title": title.strip(),  # Remove leading and trailing spaces.
-                                "description": description.strip(),  # Remove leading and trailing spaces.
-                                "url": link,
-                            }
-                        )
-                    else:
-                        self.search_result_list.append(link)
-
-                else:
-                    ROOT_LOGGER.info(f"Duplicate URL found: {link}")
-
-                # If we reached the limit of requested URLs, return with the results.
+            for elem in new_results:
+                self.search_result_list.append(elem)
+                yield elem
                 if self.max_search_result_urls_to_return <= len(self.search_result_list):
-                    return self.search_result_list
+                    # If we reached the limit of requested URLs, return with the results.
+                    ROOT_LOGGER.info("returning because self.max_search_result_urls_to_return reached")
+                    return
 
-            # Determining if a "Next" URL page of results is not straightforward.  If no valid links are found, the
-            # search results have been exhausted.
-            if valid_links_found_in_this_search == 0:
-                ROOT_LOGGER.info("No valid search results found on this page.  Moving on...")
-                return self.search_result_list
+            self.start += self.num # Bump the starting page URL parameter for the next request.
 
-            # Bump the starting page URL parameter for the next request.
-            self.start += self.num
+            if self.last_webcalls < self.webcalls: # we use this to check if something came from cache or not
+                # Randomize sleep time between paged requests to make it look more human.
+                random_sleep_time = random.choice(range(self.minimum_delay_between_paged_results_in_seconds, self.minimum_delay_between_paged_results_in_seconds + 11))
+                ROOT_LOGGER.info(f"Sleeping {random_sleep_time} seconds until retrieving the next page of results...")
+                for _ in range(random_sleep_time):
+                    if kill_event is not None and kill_event.is_set():
+                        ROOT_LOGGER.info("returning because of kill-event")
+                        return
+                    time.sleep(1)
+                self.last_webcalls = self.webcalls
 
-            # Refresh the URLs.
-            self.update_urls()
-
-            # If self.num == 10, this is the default search criteria.
-            if self.num == 10:
-                url = self.url_next_page
-            # User has specified search criteria requesting more than 10 results at a time.
-            else:
-                url = self.url_next_page_num
-
-            # Randomize sleep time between paged requests to make it look more human.
-            random_sleep_time = random.choice(
-                range(
-                    self.minimum_delay_between_paged_results_in_seconds,
-                    self.minimum_delay_between_paged_results_in_seconds + 11,
-                )
-            )
-            ROOT_LOGGER.info(f"Sleeping {random_sleep_time} seconds until retrieving the next page of results...")
-            time.sleep(random_sleep_time)
+        ROOT_LOGGER.info("returning because at the end")
