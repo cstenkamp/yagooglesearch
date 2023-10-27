@@ -1,7 +1,9 @@
 # Standard Python libraries.
 import logging
 import os
+import queue
 import random
+import threading
 import time
 import urllib
 from datetime import datetime
@@ -14,6 +16,8 @@ import librecaptcha
 
 
 __version__ = "2.0.0"
+
+from book_to_money.util.threadsafedict import ThreadSafeDict
 
 # Logging
 ROOT_LOGGER = logging.getLogger("yagooglesearch")  # ISO 8601 datetime format by default.
@@ -92,7 +96,7 @@ class SearchClient:
         verbosity=5,
         verbose_output=False,
         google_exemption=None,
-        kill_event=None,
+        global_kill_event=None,
     ):
         """
         SearchClient
@@ -141,7 +145,13 @@ class SearchClient:
         self.verbose_output = verbose_output
         self.google_exemption = google_exemption
         self.url_home = f"https://www.google.{self.tld}"
-        self.kill_event = kill_event
+
+        self.global_kill_event = global_kill_event or threading.Event()
+        self.query_kill_events = ThreadSafeDict()
+        self.page_results = ThreadSafeDict()
+        self.getpage_p1_qu, self.getpage_p2_qu, self.getpage_p3_qu = queue.Queue(), queue.Queue(), queue.Queue()
+        self.get_page_thread = threading.Thread(target=self.pagegetter_threadfn, daemon=True, name=f"YagsPaGet")
+        self.get_page_thread.start() # TODO: this is never joined
 
         # Assign log level.
         ROOT_LOGGER.setLevel((6 - self.verbosity) * 10)
@@ -166,6 +176,7 @@ class SearchClient:
         if not self.verify_ssl:
             requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
 
+
         self.reset_search(firsttime=True)
         ROOT_LOGGER.info("yagooglesearch initialized.")
 
@@ -175,10 +186,12 @@ class SearchClient:
             self.assign_user_agent(self.default_user_agent)
         if firsttime:
             # Simulates browsing to the https://www.google.com home page and retrieving the initial cookie.
-            self.get_page(self.url_home)
+            self.last_webcalls = self.webcalls = 0
+            self.get_page(self.url_home, prio=1)
             self.last_webcalls = self.webcalls = 1
 
     def get_url(self, query, start=None, num=None, extra_params=None):
+        query = urllib.parse.quote_plus(query)
         url = (
                 self.url_home + f"/search?q={query}&safe={self.safe}&"
                 + (f"hl={self.lang_html_ui}&" if self.lang_html_ui else "")
@@ -381,7 +394,7 @@ class SearchClient:
         response2 = self.request(captcha_url, data=form_inputs, additional_headers={"Referer": referer}) # TODO don't update cookies?
         print()
 
-    def get_page(self, url):
+    def _get_page_mainthread(self, url):
         """
         Request the given URL and return the response page.
         :param str url: URL to retrieve.
@@ -396,39 +409,73 @@ class SearchClient:
         # TODO: do these both ^ in the first get-google.com call
 
         html = ""
-
         if response.status_code == 200:
             html = response.text
-
         elif response.status_code == 429:
             ROOT_LOGGER.warning("Google is blocking your IP for making too many requests in a specific time period.")
-
             self.solve_recaptcha(response, url)
             # TODO: this ^ only optional and if interactive and ...
-
-            # Calling script does not want yagooglesearch to handle HTTP 429 cool off and retry.  Just return a notification string.
             if not self.yagooglesearch_manages_http_429s:
+                # Calling script does not want yagooglesearch to handle HTTP 429 cool off and retry.  Just return a notification string.
                 ROOT_LOGGER.info("Since yagooglesearch_manages_http_429s=False, yagooglesearch is done.")
                 return "HTTP_429_DETECTED"
-
             ROOT_LOGGER.info(f"Sleeping for {self.http_429_cool_off_time_in_minutes} minutes...")
-            time.sleep(self.http_429_cool_off_time_in_minutes * 60)
+            time.sleep(self.http_429_cool_off_time_in_minutes * 60) # TODO: do the loop that allows for kill_event
             self.http_429_detected()
-
-            # Try making the request again.
-            html = self.get_page(url)
-
+            html = self._get_page_mainthread(url)  # Try making the request again.
         else:
-            ROOT_LOGGER.warning(f"HTML response code: {response.status_code}")
+            ROOT_LOGGER.error(f"HTML response code: {response.status_code}")
 
         return html
 
-    def results_from_url(self, url, prev_results_ref=None):
+    def end_search(self, query, reason=None):
+        """sets the kill-event for one specific query"""
+        ROOT_LOGGER.info(f"Ending search for `{query}`" + (f" because {reason}" if reason is not None else ""))
+        self.query_kill_events[query].set()
+
+    def search_ended(self, query):
+        if query is None:
+            return False
+        return self.query_kill_events[query].is_set()
+
+    def pagegetter_threadfn(self):
+        while not self.globally_killed:  # TODO actually use globally_killed!
+            url, query = None, None
+            if not self.getpage_p1_qu.empty():
+                url, query = self.getpage_p1_qu.get()
+            elif not self.getpage_p2_qu.empty():
+                url, query = self.getpage_p2_qu.get()
+            elif not self.getpage_p3_qu.empty():
+                url, query = self.getpage_p3_qu.get()
+            if url is not None and not self.search_ended(query):
+                self.page_results[url] = self._get_page_mainthread(url)
+                if url != self.url_home:
+                    self.sleep_against_429()
+            time.sleep(0.01)
+
+    def get_page(self, url, query=None, prio=2):
+        """so the idea is that we call _get_page_mainthread only in one thread, and all calls to get_page will only enqueue their demand.
+        We also want priorities however: self.url_home has no wait time, and first result-pages have priority over non-first (breadth-first basically)!"""
+        # TODO: ensure this is compatible with global kill_event!
+        addto = self.getpage_p1_qu if prio == 1 else self.getpage_p2_qu if prio == 2 else self.getpage_p3_qu
+        addto.put((url, query))
+        while url not in self.page_results:
+            if self.search_ended(query):
+                return
+            time.sleep(0.01)
+        res = self.page_results[url]
+        del self.page_results[url]
+        return res
+
+    def results_from_url(self, url, prev_results_ref=None, query=None, pagenum=0):
+        # need query to find its kill-event and pagenum for the get-page-priority
         # we want to cache this method, so ensure that this is side-effect free!
         results = []
         prev_results_ref = prev_results_ref or []
 
-        html = self.get_page(url) # Request Google search results.
+        html = self.get_page(url, query=query, prio=2 if pagenum == 0 else 3)  # Breadth-First-Search!
+        if self.search_ended(query):
+            return ["THIS_SEARCH_KILLED"]
 
         if html == "HTTP_429_DETECTED":
             # HTTP 429 message returned from get_page() function, add "HTTP_429_DETECTED" to the set and return to the calling script.
@@ -486,19 +533,19 @@ class SearchClient:
         return results
 
     def sleep_against_429(self):
-        if self.last_webcalls < self.webcalls: # we use this to check if something came from cache or not
+        if self.last_webcalls < self.webcalls:  # we use this to check if something came from cache or not
             # Randomize sleep time between paged requests to make it look more human.
             random_sleep_time = random.choice(range(self.minimum_delay_between_paged_results_in_seconds, self.minimum_delay_between_paged_results_in_seconds + 11))
-            ROOT_LOGGER.info(f"Sleeping {random_sleep_time} seconds until retrieving the next page of results...")
+            ROOT_LOGGER.warning(f"Sleeping {random_sleep_time} seconds until retrieving the next google-page...")
             for _ in range(random_sleep_time):
-                if self.killed:
+                if self.globally_killed:
                     return
                 time.sleep(1)
             self.last_webcalls = self.webcalls
 
     @property
-    def killed(self):
-        return self.kill_event is not None and self.kill_event.is_set()
+    def globally_killed(self):
+        return self.global_kill_event is not None and self.global_kill_event.is_set()
 
     def search_gen(self, query, start=0, num=100, extra_params=None, max_result_urls=30, assign_new_ua=False):
         """
@@ -510,27 +557,31 @@ class SearchClient:
             you don't want Google to filter similar results you can set the extra_params to {'filter': '0'} which will
             append '&filter=0' to every query.
         """
+        self.query_kill_events[query] = threading.Event()  # each search has its own kill_event that stops it
+
         if num > 100:
             ROOT_LOGGER.warning("The largest value allowed by Google for num is 100.  Setting num to 100.")
             num = 100
-        query = urllib.parse.quote_plus(query)
 
         self.reset_search(new_ua=assign_new_ua) # if demanded, every  new search is done with a new user-agent
         search_result_list = [] # Consolidate search results.
 
+        pagenum = 0
         # Loop until we reach the maximum result results found or there are no more search results found to reach max_result_urls.
         while len(search_result_list) <= max_result_urls:
 
             ROOT_LOGGER.info(f"Stats: start={start}, num={num}, non-dup links found={len(search_result_list)}/{max_result_urls}")
 
             url = self.get_url(query, start=start, num=num, extra_params=extra_params)
-            new_results = self.results_from_url(url, prev_results_ref=search_result_list)
+            new_results = self.results_from_url(url, prev_results_ref=search_result_list, query=query, pagenum=pagenum)
 
             if new_results == ["HTTP_429_DETECTED"]:
                 # this happens only if yagooglesearch_manages_429 == False
                 search_result_list.append("HTTP_429_DETECTED")
-                yield "HTTP_429_DETECTED" # TODO this is what effing exceptions are for
+                yield "HTTP_429_DETECTED"  # TODO this is what effing exceptions are for
                 return "HTTP_429_DETECTED"
+            elif new_results == ["THIS_SEARCH_KILLED"]:
+                return "THIS_SEARCH_KILLED"
             elif not new_results:
                 # Determining if a "Next" URL page of results is not straightforward. If no valid links are found, the search results have been exhausted.
                 ROOT_LOGGER.info("No valid search results found on this page. Returning.")
@@ -544,11 +595,18 @@ class SearchClient:
                     ROOT_LOGGER.info("returning because max_result_urls reached")
                     return "MAX_RESULTS_REACHED"
 
-            start += num # Bump the starting page URL parameter for the next request.
+            start += num  # Bump the starting page URL parameter for the next request.
+            pagenum += 1
 
-            self.sleep_against_429()
-            if self.killed:
-                ROOT_LOGGER.info("returning because of kill-event")
-                return "SEARCH_KILLED"
+            # self.sleep_against_429()  # superflous in multi-threading-contexts - maybe useful if we have params for this to be single-threaded
+
+            if self.globally_killed:
+                ROOT_LOGGER.info("returning because of global kill-event")
+                return "ALL_SEARCHES_KILLED"
+            if self.search_ended(query):
+                # will likely never get here bc then we also get the "THIS_SEARCH_KILLED" as new_results
+                ROOT_LOGGER.info(f"returning because of kill-event for query `{query}`")
+                return "THIS_SEARCH_KILLED"
 
         ROOT_LOGGER.info("returning because at the end")
+        return "GENERATOR_END"
