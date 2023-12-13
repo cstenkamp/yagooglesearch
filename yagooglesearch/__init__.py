@@ -86,7 +86,7 @@ class SearchClient:
         tbs="0",
         safe="off",
         country="",
-        minimum_delay_between_paged_results_in_seconds=7,
+        min_request_delay=7,
         user_agent=None,
         yagooglesearch_manages_http_429s=True,
         http_429_cool_off_time_in_minutes=60,
@@ -108,7 +108,7 @@ class SearchClient:
         :param str safe: Safe search.
         :param str country: Country or region to focus the search on.  Similar to changing the TLD, but does not yield
             exactly the same results.  Only Google knows why...
-        :param int minimum_delay_between_paged_results_in_seconds: Minimum time to wait between HTTP requests for
+        :param int min_request_delay: Minimum time to wait between HTTP requests for
             consecutive pages for the same search query.  The actual time will be a random value between this minimum
             value and value + 11 to make it look more human.
         :param str user_agent: Hard-coded user agent for the HTTP requests.
@@ -134,7 +134,7 @@ class SearchClient:
         self.tbs = tbs
         self.safe = safe
         self.country = country
-        self.minimum_delay_between_paged_results_in_seconds = minimum_delay_between_paged_results_in_seconds
+        self.min_request_delay = min_request_delay
         self.default_user_agent = user_agent
         self.yagooglesearch_manages_http_429s = yagooglesearch_manages_http_429s
         self.http_429_cool_off_time_in_minutes = http_429_cool_off_time_in_minutes
@@ -151,10 +151,10 @@ class SearchClient:
         self.page_results = ThreadSafeDict()
         self.getpage_p1_qu, self.getpage_p2_qu, self.getpage_p3_qu = queue.Queue(), queue.Queue(), queue.Queue()
         self.get_page_thread = threading.Thread(target=self.pagegetter_threadfn, daemon=True, name=f"YagsPaGet")
-        self.get_page_thread.start() # TODO: this is never joined
+        self.get_page_thread.start()  # TODO: this is never joined
 
-        # Assign log level.
-        ROOT_LOGGER.setLevel((6 - self.verbosity) * 10)
+        if self.verbosity is not None:  # otherwise just take the parent level
+            ROOT_LOGGER.setLevel((6 - self.verbosity) * 10)
 
         # Argument checks.
         if self.lang_result is not None:
@@ -169,14 +169,12 @@ class SearchClient:
         # Populate cookies with GOOGLE_ABUSE_EXEMPTION if it is provided.  Otherwise, initialize empty. Will be updated with each request in get_page().
         self.cookies = {"GOOGLE_ABUSE_EXEMPTION": self.google_exemption} if self.google_exemption else {}
 
-        # Initialize proxy_dict.
         self.proxy_dict = {"http": self.proxy, "https": self.proxy} if self.proxy else {}
 
-        # Suppress warning messages if verify_ssl is disabled.
-        if not self.verify_ssl:
+        if not self.verify_ssl:  # Suppress warning messages if verify_ssl is disabled.
             requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
 
-
+        # TODO: the setting of the user-agent is probably chaotic rn
         self.reset_search(firsttime=True)
         ROOT_LOGGER.info("yagooglesearch initialized.")
 
@@ -535,8 +533,8 @@ class SearchClient:
     def sleep_against_429(self):
         if self.last_webcalls < self.webcalls:  # we use this to check if something came from cache or not
             # Randomize sleep time between paged requests to make it look more human.
-            random_sleep_time = random.choice(range(self.minimum_delay_between_paged_results_in_seconds, self.minimum_delay_between_paged_results_in_seconds + 11))
-            ROOT_LOGGER.warning(f"Sleeping {random_sleep_time} seconds until retrieving the next google-page...")
+            random_sleep_time = random.choice(range(self.min_request_delay, self.min_request_delay + 11))
+            ROOT_LOGGER.info(f"Sleeping {random_sleep_time} seconds until retrieving the next google-page...")
             for _ in range(random_sleep_time):
                 if self.globally_killed:
                     return
